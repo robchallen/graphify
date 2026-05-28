@@ -41,6 +41,7 @@ dependencies = [
     "tree-sitter-bash",
     "tree-sitter-json",
     "tree-sitter-dm",
+    "tree-sitter-language-pack",
 ]
 
 [project.urls]

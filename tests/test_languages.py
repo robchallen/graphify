@@ -6,7 +6,7 @@ from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
     extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
-    extract_groovy, extract_sln, extract_csproj, extract_razor,
+    extract_groovy, extract_r, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
 )
 
@@ -216,6 +216,31 @@ def test_ruby_finds_methods():
 def test_ruby_finds_function():
     r = extract_ruby(FIXTURES / "sample.rb")
     assert any("parse_response" in l for l in _labels(r))
+
+
+# ── R ────────────────────────────────────────────────────────────────────────
+
+def test_r_no_error():
+    r = extract_r(FIXTURES / "sample.r")
+    assert "error" not in r
+
+
+def test_r_finds_functions():
+    r = extract_r(FIXTURES / "sample.r")
+    labels = _labels(r)
+    assert any("build_plot" in l for l in labels)
+    assert any("main" in l for l in labels)
+
+
+def test_r_finds_imports():
+    r = extract_r(FIXTURES / "sample.r")
+    assert "imports" in _relations(r) or "imports_from" in _relations(r)
+
+
+def test_r_emits_calls():
+    r = extract_r(FIXTURES / "sample.r")
+    calls = _calls(r)
+    assert any("main" in src and "build_plot" in tgt for src, tgt in calls)
 
 
 # ── C# ───────────────────────────────────────────────────────────────────────

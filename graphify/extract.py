@@ -447,6 +447,18 @@ def _read_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
+def _load_tree_sitter_language_pack_language(language_name: str):
+    """Load a tree-sitter Language from tree-sitter-language-pack."""
+    try:
+        from tree_sitter_language_pack import get_language, has_language
+    except ImportError as exc:
+        raise ImportError("tree-sitter-language-pack not installed") from exc
+
+    if not has_language(language_name):
+        raise ValueError(f"tree-sitter-language-pack has no grammar for {language_name}")
+    return get_language(language_name)
+
+
 _PYTHON_TYPE_CONTAINERS = frozenset({
     "list", "dict", "set", "tuple", "frozenset", "type",
     "List", "Dict", "Set", "Tuple", "FrozenSet", "Type",
@@ -3569,6 +3581,241 @@ def extract_sql(path: Path) -> dict:
 def extract_lua(path: Path) -> dict:
     """Extract functions, methods, require() imports, and calls from a .lua file."""
     return _extract_generic(path, _LUA_CONFIG)
+
+
+_R_IMPORT_FUNCTIONS = frozenset({"library", "require", "requireNamespace"})
+
+
+def _r_assignment_operator(node, source: bytes) -> str | None:
+    op = node.child_by_field_name("operator")
+    return _read_text(op, source) if op is not None else None
+
+
+def _r_assigned_function_name(node, source: bytes) -> str | None:
+    lhs = node.child_by_field_name("lhs")
+    rhs = node.child_by_field_name("rhs")
+    op = _r_assignment_operator(node, source)
+    if lhs is not None and rhs is not None and rhs.type == "function_definition" and op in {"<-", "<<-", "="}:
+        return _read_text(lhs, source) if lhs.type == "identifier" else None
+    if lhs is not None and rhs is not None and lhs.type == "function_definition" and op in {"->", "->>"}:
+        return _read_text(rhs, source) if rhs.type == "identifier" else None
+    return None
+
+
+def _r_string_value(node, source: bytes) -> str | None:
+    if node is None:
+        return None
+    if node.type == "argument":
+        value = node.child_by_field_name("value")
+        if value is not None:
+            node = value
+        else:
+            named_children = [child for child in node.children if child.is_named]
+            if not named_children:
+                return None
+            node = named_children[-1]
+    if node.type != "string":
+        return None
+    chunks = [_read_text(child, source) for child in node.children if child.type == "string_content"]
+    if chunks:
+        return "".join(chunks)
+    return _read_text(node, source).strip("'\"")
+
+
+def _r_argument_value(node):
+    if node is None:
+        return None
+    if node.type != "argument":
+        return node
+    value = node.child_by_field_name("value")
+    if value is not None:
+        return value
+    named_children = [child for child in node.children if child.is_named]
+    return named_children[-1] if named_children else None
+
+
+def _r_first_argument(call_node):
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return None
+    for child in args.children:
+        if child.type == "argument":
+            return child
+    return None
+
+
+def _r_namespace_parts(node, source: bytes) -> tuple[str | None, str | None]:
+    lhs = node.child_by_field_name("lhs")
+    rhs = node.child_by_field_name("rhs")
+    package = _read_text(lhs, source) if lhs is not None and lhs.type == "identifier" else None
+    symbol = _read_text(rhs, source) if rhs is not None and rhs.type == "identifier" else None
+    return package, symbol
+
+
+def extract_r(path: Path) -> dict:
+    """Extract functions, package imports, sourced files, and local calls from .r/.R files."""
+    try:
+        from tree_sitter import Parser
+        language = _load_tree_sitter_language_pack_language("r")
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree-sitter-language-pack not installed"}
+    except Exception as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+    try:
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, object]] = []
+    seen_import_edges: set[tuple[str, str, str]] = set()
+    raw_calls: list[dict] = []
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid in seen_ids:
+            return
+        seen_ids.add(nid)
+        nodes.append({
+            "id": nid,
+            "label": label,
+            "file_type": "code",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int, *,
+                 context: str | None = None, confidence: str = "EXTRACTED") -> None:
+        edge = {
+            "source": src,
+            "target": tgt,
+            "relation": relation,
+            "confidence": confidence,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def add_import_edge(target_nid: str, relation: str, line: int) -> None:
+        key = (file_nid, target_nid, relation)
+        if key in seen_import_edges:
+            return
+        seen_import_edges.add(key)
+        add_edge(file_nid, target_nid, relation, line, context="import")
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    def walk_defs_and_imports(node) -> None:
+        if node.type == "binary_operator":
+            func_name = _r_assigned_function_name(node, source)
+            if func_name:
+                func_nid = _make_id(stem, func_name)
+                line = node.start_point[0] + 1
+                add_node(func_nid, f"{func_name}()", line)
+                add_edge(file_nid, func_nid, "contains", line)
+                rhs = node.child_by_field_name("rhs")
+                if rhs is not None and rhs.type == "function_definition":
+                    body = rhs.child_by_field_name("body")
+                else:
+                    lhs = node.child_by_field_name("lhs")
+                    body = lhs.child_by_field_name("body") if lhs is not None and lhs.type == "function_definition" else None
+                if body is not None:
+                    function_bodies.append((func_nid, body))
+                    walk_defs_and_imports(body)
+                return
+
+        if node.type == "call":
+            func_node = node.child_by_field_name("function")
+            line = node.start_point[0] + 1
+            if func_node is not None and func_node.type == "identifier":
+                func_name = _read_text(func_node, source)
+                if func_name in _R_IMPORT_FUNCTIONS:
+                    arg = _r_first_argument(node)
+                    target = _r_argument_value(arg)
+                    if target is not None and target.type == "identifier":
+                        add_import_edge(_make_id(_read_text(target, source)), "imports", line)
+                    else:
+                        raw = _r_string_value(arg, source)
+                        if raw:
+                            add_import_edge(_make_id(raw), "imports", line)
+                elif func_name == "source":
+                    raw = _r_string_value(_r_first_argument(node), source)
+                    if raw:
+                        candidate = Path(raw)
+                        resolved = (path.parent / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+                        target_nid = _make_id(str(resolved)) if resolved.is_file() else _make_id(candidate.stem or raw)
+                        add_import_edge(target_nid, "imports_from", line)
+            elif func_node is not None and func_node.type == "namespace_operator":
+                package_name, _ = _r_namespace_parts(func_node, source)
+                if package_name:
+                    add_import_edge(_make_id(package_name), "imports", line)
+
+        for child in node.children:
+            if child.is_named:
+                walk_defs_and_imports(child)
+
+    walk_defs_and_imports(root)
+
+    label_to_nid = {
+        node["label"].strip("()").lstrip("."): node["id"]
+        for node in nodes
+    }
+    seen_call_pairs: set[tuple[str, str]] = set()
+
+    def walk_calls(node, caller_nid: str) -> None:
+        if node.type == "binary_operator" and _r_assigned_function_name(node, source):
+            return
+
+        if node.type == "call":
+            func_node = node.child_by_field_name("function")
+            callee_name: str | None = None
+            is_member_call = False
+            if func_node is not None:
+                if func_node.type == "identifier":
+                    callee_name = _read_text(func_node, source)
+                elif func_node.type == "extract_operator":
+                    is_member_call = True
+                    rhs = func_node.child_by_field_name("rhs")
+                    if rhs is not None and rhs.type == "identifier":
+                        callee_name = _read_text(rhs, source)
+                elif func_node.type == "namespace_operator":
+                    callee_name = None
+
+            if callee_name and callee_name not in _R_IMPORT_FUNCTIONS and callee_name != "source":
+                tgt_nid = label_to_nid.get(callee_name)
+                if tgt_nid and tgt_nid != caller_nid:
+                    pair = (caller_nid, tgt_nid)
+                    if pair not in seen_call_pairs:
+                        seen_call_pairs.add(pair)
+                        add_edge(caller_nid, tgt_nid, "calls", node.start_point[0] + 1, context="call")
+                elif tgt_nid is None and callee_name not in _LANGUAGE_BUILTIN_GLOBALS:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": callee_name,
+                        "is_member_call": is_member_call,
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                    })
+
+        for child in node.children:
+            if child.is_named:
+                walk_calls(child, caller_nid)
+
+    for caller_nid, body in function_bodies:
+        walk_calls(body, caller_nid)
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
 
 
 def extract_swift(path: Path) -> dict:
@@ -8795,6 +9042,8 @@ _DISPATCH: dict[str, Any] = {
     ".sv": extract_verilog,
     ".svh": extract_verilog,
     ".sql": extract_sql,
+    ".r": extract_r,
+    ".R": extract_r,
     ".md": extract_markdown,
     ".mdx": extract_markdown,
     ".qmd": extract_markdown,

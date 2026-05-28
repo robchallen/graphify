@@ -38,6 +38,7 @@ def test_watched_extensions_includes_code():
     assert ".ts" in _WATCHED_EXTENSIONS
     assert ".go" in _WATCHED_EXTENSIONS
     assert ".rs" in _WATCHED_EXTENSIONS
+    assert ".r" in _WATCHED_EXTENSIONS
 
 def test_watched_extensions_includes_docs():
     assert ".md" in _WATCHED_EXTENSIONS

@@ -236,6 +236,13 @@ def test_collect_files_follows_symlinked_directory(tmp_path):
     assert [f.name for f in files_yes].count("lib.py") == 2
 
 
+def test_collect_files_supports_uppercase_r_extension(tmp_path):
+    src = tmp_path / "sample.R"
+    src.write_text("main <- function() {}\n")
+    files = collect_files(tmp_path)
+    assert src in files
+
+
 def test_collect_files_handles_circular_symlinks(tmp_path):
     sub = tmp_path / "pkg"
     sub.mkdir()
@@ -1058,5 +1065,4 @@ def test_dart_child_node_ids_are_stem_based(tmp_path):
             f"Child node ID '{node['id']}' does not start with the expected stem prefix '{stem}'. "
             "This suggests an absolute path is still leaking into the ID."
         )
-
 

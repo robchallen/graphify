@@ -206,14 +206,16 @@ def test_extract_dispatches_all_languages():
         FIXTURES / "sample.ts",
         FIXTURES / "sample.go",
         FIXTURES / "sample.rs",
+        FIXTURES / "sample.r",
     ]
     r = extract(files)
     source_files = {n["source_file"] for n in r["nodes"] if n["source_file"]}
-    # All four files should contribute nodes
+    # All files should contribute nodes
     assert any("sample.py" in f for f in source_files)
     assert any("sample.ts" in f for f in source_files)
     assert any("sample.go" in f for f in source_files)
     assert any("sample.rs" in f for f in source_files)
+    assert any("sample.r" in f for f in source_files)
 
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
